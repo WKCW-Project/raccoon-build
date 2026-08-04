@@ -1,0 +1,123 @@
+name: Build Raccoon Kernel
+
+on:
+  workflow_dispatch:
+    inputs:
+      clang_choice:
+        description: 'Choose Clang toolchain'
+        required: true
+        default: '1'
+        type: choice
+        options:
+          - '1'   # Zyc Clang 16.0.6
+          - '2'   # Prelude Clang 16.0.2
+      kernel_branch:
+        description: 'Kernel branch to build'
+        required: true
+        default: 'raccoon'
+
+env:
+  KERNEL_REPO: https://github.com/WKCW-Project/android_kernel_raccoon-66.git
+  KERNEL_DEFCONFIG: raccoon_defconfig
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Clone kernel source
+        run: |
+          git clone --depth=1 --branch "${{ github.event.inputs.kernel_branch }}" \
+            "$KERNEL_REPO" "$GITHUB_WORKSPACE/kernel"
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            clang lld llvm gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi \
+            gzip xz-utils lz4 zstd build-essential bc bison flex \
+            libssl-dev libncurses-dev dwarves git curl \
+            wget unzip rsync python3 python3-pip cmake binutils libelf-dev \
+            elfutils zip perl
+
+      - name: Setup workspace paths
+        run: |
+          echo "MAIN=$GITHUB_WORKSPACE" >> "$GITHUB_ENV"
+          echo "KERNEL_DIR=$GITHUB_WORKSPACE/kernel" >> "$GITHUB_ENV"
+          echo "CLANG_DIR=$GITHUB_WORKSPACE/toolchains/clang" >> "$GITHUB_ENV"
+
+      - name: Cache Clang toolchain
+        id: clang-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CLANG_DIR }}
+          key: clang-${{ github.event.inputs.clang_choice }}
+
+      - name: Download / Setup Clang
+        if: steps.clang-cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p "$CLANG_DIR"
+          if [ "${{ github.event.inputs.clang_choice }}" = "1" ]; then
+            CLANG_URL="https://github.com/ZyCromerZ/Clang/releases/download/16.0.6-20250721-release/Clang-16.0.6-20250721.tar.gz"
+            wget -O "$MAIN/clang.tar.gz" "$CLANG_URL"
+            tar -xf "$MAIN/clang.tar.gz" -C "$CLANG_DIR"
+            rm -f "$MAIN/clang.tar.gz"
+          else
+            git clone --depth=1 https://gitlab.com/jjpprrrr/prelude-clang.git "$CLANG_DIR"
+          fi
+
+      - name: Verify Clang
+        run: |
+          export PATH="$CLANG_DIR/bin:$PATH"
+          clang --version
+
+      - name: Build kernel
+        run: |
+          export PATH="$CLANG_DIR/bin:$PATH"
+          export ARCH=arm64
+          export SUBARCH=arm64
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          export KBUILD_COMPILER_STRING="$($CLANG_DIR/bin/clang --version | head -n 1 | perl -pe 's/\(http.*?\)//gs' | sed -e 's/  */ /g' -e 's/[[:space:]]*$//')"
+          cd "$KERNEL_DIR"
+          OUT_DIR="$KERNEL_DIR/out"
+          make O="$OUT_DIR" CC=clang LLVM=1 LLVM_IAS=1 KCFLAGS="-w" $KERNEL_DEFCONFIG
+          make -j$(nproc --all) O="$OUT_DIR" CC=clang LLVM=1 LLVM_IAS=1 KCFLAGS="-w"
+
+      - name: Package into AnyKernel zip
+        run: |
+          cd "$KERNEL_DIR"
+          OUT_DIR="$KERNEL_DIR/out"
+          ZIMAGE_DIR="$OUT_DIR/arch/arm64/boot"
+          TIME=$(date "+%Y%m%d-%H%M%S")
+          TEMP_ANY_KERNEL_DIR="$KERNEL_DIR/anykernel_temp"
+
+          rm -rf "$TEMP_ANY_KERNEL_DIR"
+
+          if [ -d "$KERNEL_DIR/anykernel" ]; then
+            cp -r "$KERNEL_DIR/anykernel" "$TEMP_ANY_KERNEL_DIR"
+          else
+            echo "Error: anykernel directory not found!"
+            exit 1
+          fi
+
+          if [ -f "$ZIMAGE_DIR/Image.gz-dtb" ]; then
+            cp -v "$ZIMAGE_DIR/Image.gz-dtb" "$TEMP_ANY_KERNEL_DIR/"
+          elif [ -f "$ZIMAGE_DIR/Image.gz" ]; then
+            cp -v "$ZIMAGE_DIR/Image.gz" "$TEMP_ANY_KERNEL_DIR/"
+          elif [ -f "$ZIMAGE_DIR/Image" ]; then
+            cp -v "$ZIMAGE_DIR/Image" "$TEMP_ANY_KERNEL_DIR/"
+          fi
+
+          ZIP_NAME="Raccoon-66-$TIME.zip"
+          cd "$TEMP_ANY_KERNEL_DIR"
+          zip -r9 "$KERNEL_DIR/$ZIP_NAME" ./*
+          cd ..
+          rm -rf "$TEMP_ANY_KERNEL_DIR"
+
+          echo "ZIP_NAME=$ZIP_NAME" >> "$GITHUB_ENV"
+
+      - name: Upload kernel zip artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ZIP_NAME }}
+          path: kernel/${{ env.ZIP_NAME }}
+          retention-days: 7
