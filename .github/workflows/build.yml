@@ -24,6 +24,21 @@ on:
         description: 'Kernel branch to build'
         required: true
         default: 'raccoon'
+      create_release:
+        description: 'Publish result as a GitHub Release?'
+        required: true
+        default: 'no'
+        type: choice
+        options:
+          - 'no'
+          - 'yes'
+      release_tag:
+        description: 'Release tag (only used if create_release = yes, e.g. v1.0.0)'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
 
 env:
   KERNEL_REPO: https://github.com/WKCW-Project/android_kernel_raccoon-66.git
@@ -273,3 +288,11 @@ jobs:
           name: ${{ env.KSU_ZIP_NAME }}
           path: kernel/${{ env.KSU_ZIP_NAME }}
           retention-days: 7
+
+      - name: Create GitHub Release
+        if: github.event.inputs.create_release == 'yes'
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ github.event.inputs.release_tag }}
+          name: ${{ github.event.inputs.release_tag }}
+          files: kernel/*.zip
