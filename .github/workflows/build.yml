@@ -139,39 +139,15 @@ jobs:
         run: |
           set -euo pipefail
 
-          KSU_REF="main"
-
-          echo "=== Setting up ReSukiSU (ref: $KSU_REF) ==="
+          echo "=== Setting up ReSukiSU ==="
 
           cd "$KERNEL_DIR"
-          DRIVER_DIR=""
-          if [ -d "common/drivers" ]; then
-            DRIVER_DIR="common/drivers"
-          elif [ -d "drivers" ]; then
-            DRIVER_DIR="drivers"
-          else
-            echo "ERROR: drivers/ directory not found"
-            exit 1
-          fi
+          KDIR="."
+          [ -d "common" ] && KDIR="common"
+          cd "$KDIR"
 
-          # Clone ReSukiSU
-          git clone https://github.com/ReSukiSU/ReSukiSU KernelSU
-          cd KernelSU
-          git checkout "$KSU_REF" || git checkout main
-          git pull --ff-only origin "$KSU_REF" 2>/dev/null || git pull --ff-only origin main || true
-          cd ..
+          curl -LSs "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh" | bash
 
-          # Create symlink
-          cd "$DRIVER_DIR"
-          ln -sf "../../KernelSU/kernel" "kernelsu"
-
-          # Modify Makefile
-          grep -q "kernelsu" Makefile || printf '\nobj-$(CONFIG_KSU) += kernelsu/\n' >> Makefile
-
-          # Modify Kconfig
-          grep -q 'source "drivers/kernelsu/Kconfig"' Kconfig || sed -i '/endmenu/i\source "drivers/kernelsu/Kconfig"' Kconfig
-
-          cd "$KERNEL_DIR"
           echo "ReSukiSU setup complete"
 
       - name: Setup SUSFS
