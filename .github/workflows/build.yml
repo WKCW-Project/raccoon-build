@@ -3,6 +3,15 @@ name: Build Raccoon Kernel
 on:
   workflow_dispatch:
     inputs:
+      build_variant:
+        description: 'What to build'
+        required: true
+        default: 'both'
+        type: choice
+        options:
+          - 'stock'          # Stock kernel only, no KernelSU/SUSFS
+          - 'ksu_susfs'       # ReSukiSU + SUSFS only
+          - 'both'            # Build stock first, then KSU+SUSFS on top of the same clone
       clang_choice:
         description: 'Choose Clang toolchain'
         required: true
@@ -70,7 +79,8 @@ jobs:
           export PATH="$CLANG_DIR/bin:$PATH"
           clang --version
 
-      - name: Build kernel
+      - name: Build kernel (stock)
+        if: contains(fromJson('["stock","both"]'), github.event.inputs.build_variant)
         run: |
           export PATH="$CLANG_DIR/bin:$PATH"
           export ARCH=arm64
@@ -78,17 +88,18 @@ jobs:
           export CROSS_COMPILE=aarch64-linux-gnu-
           export KBUILD_COMPILER_STRING="$($CLANG_DIR/bin/clang --version | head -n 1 | perl -pe 's/\(http.*?\)//gs' | sed -e 's/  */ /g' -e 's/[[:space:]]*$//')"
           cd "$KERNEL_DIR"
-          OUT_DIR="$KERNEL_DIR/out"
+          OUT_DIR="$KERNEL_DIR/out-stock"
           make O="$OUT_DIR" CC=clang LLVM=1 LLVM_IAS=1 KCFLAGS="-w" $KERNEL_DEFCONFIG
           make -j$(nproc --all) O="$OUT_DIR" CC=clang LLVM=1 LLVM_IAS=1 KCFLAGS="-w"
 
-      - name: Package into AnyKernel zip
+      - name: Package stock build into AnyKernel zip
+        if: contains(fromJson('["stock","both"]'), github.event.inputs.build_variant)
         run: |
           cd "$KERNEL_DIR"
-          OUT_DIR="$KERNEL_DIR/out"
+          OUT_DIR="$KERNEL_DIR/out-stock"
           ZIMAGE_DIR="$OUT_DIR/arch/arm64/boot"
           TIME=$(date "+%Y%m%d-%H%M%S")
-          TEMP_ANY_KERNEL_DIR="$KERNEL_DIR/anykernel_temp"
+          TEMP_ANY_KERNEL_DIR="$KERNEL_DIR/anykernel_temp_stock"
 
           rm -rf "$TEMP_ANY_KERNEL_DIR"
 
@@ -107,17 +118,182 @@ jobs:
             cp -v "$ZIMAGE_DIR/Image" "$TEMP_ANY_KERNEL_DIR/"
           fi
 
-          ZIP_NAME="Raccoon-66-$TIME.zip"
+          ZIP_NAME="Raccoon-66-Stock-$TIME.zip"
           cd "$TEMP_ANY_KERNEL_DIR"
           zip -r9 "$KERNEL_DIR/$ZIP_NAME" ./*
           cd ..
           rm -rf "$TEMP_ANY_KERNEL_DIR"
 
-          echo "ZIP_NAME=$ZIP_NAME" >> "$GITHUB_ENV"
+          echo "STOCK_ZIP_NAME=$ZIP_NAME" >> "$GITHUB_ENV"
 
-      - name: Upload kernel zip artifact
+      - name: Upload stock zip artifact
+        if: contains(fromJson('["stock","both"]'), github.event.inputs.build_variant)
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ env.ZIP_NAME }}
-          path: kernel/${{ env.ZIP_NAME }}
+          name: ${{ env.STOCK_ZIP_NAME }}
+          path: kernel/${{ env.STOCK_ZIP_NAME }}
+          retention-days: 7
+
+      - name: Setup ReSukiSU
+        if: contains(fromJson('["ksu_susfs","both"]'), github.event.inputs.build_variant)
+        run: |
+          set -euo pipefail
+
+          KSU_REF="main"
+
+          echo "=== Setting up ReSukiSU (ref: $KSU_REF) ==="
+
+          cd "$KERNEL_DIR"
+          DRIVER_DIR=""
+          if [ -d "common/drivers" ]; then
+            DRIVER_DIR="common/drivers"
+          elif [ -d "drivers" ]; then
+            DRIVER_DIR="drivers"
+          else
+            echo "ERROR: drivers/ directory not found"
+            exit 1
+          fi
+
+          # Clone ReSukiSU
+          git clone https://github.com/ReSukiSU/ReSukiSU KernelSU
+          cd KernelSU
+          git checkout "$KSU_REF" || git checkout main
+          git pull --ff-only origin "$KSU_REF" 2>/dev/null || git pull --ff-only origin main || true
+          cd ..
+
+          # Create symlink
+          cd "$DRIVER_DIR"
+          ln -sf "../../KernelSU/kernel" "kernelsu"
+
+          # Modify Makefile
+          grep -q "kernelsu" Makefile || printf '\nobj-$(CONFIG_KSU) += kernelsu/\n' >> Makefile
+
+          # Modify Kconfig
+          grep -q 'source "drivers/kernelsu/Kconfig"' Kconfig || sed -i '/endmenu/i\source "drivers/kernelsu/Kconfig"' Kconfig
+
+          cd "$KERNEL_DIR"
+          echo "ReSukiSU setup complete"
+
+      - name: Setup SUSFS
+        if: contains(fromJson('["ksu_susfs","both"]'), github.event.inputs.build_variant)
+        run: |
+          set -euo pipefail
+
+          SUSFS_BRANCH="gki-android15-6.6"
+
+          echo "=== Setting up SUSFS (branch: $SUSFS_BRANCH) ==="
+
+          git clone --depth=1 https://gitlab.com/simonpunk/susfs4ksu.git -b "$SUSFS_BRANCH" "$MAIN/susfs4ksu"
+
+          cd "$KERNEL_DIR"
+          KDIR="."
+          [ -d "common" ] && KDIR="common"
+          cd "$KDIR"
+
+          # Copy SUSFS kernel patches
+          cp "$MAIN/susfs4ksu/kernel_patches/fs/"* fs/
+          cp "$MAIN/susfs4ksu/kernel_patches/include/linux/"* include/linux/
+
+          # Apply SUSFS GKI patch
+          cp "$MAIN/susfs4ksu/kernel_patches/50_add_susfs_in_gki-android15-6.6.patch" .
+          patch -p1 < 50_add_susfs_in_gki-android15-6.6.patch
+
+          echo "SUSFS setup complete"
+
+      - name: Enable Kernel Configs
+        if: contains(fromJson('["ksu_susfs","both"]'), github.event.inputs.build_variant)
+        run: |
+          set -euo pipefail
+
+          cd "$KERNEL_DIR"
+          KDIR="."
+          [ -d "common" ] && KDIR="common"
+          cd "$KDIR"
+
+          DEFCONFIG="arch/arm64/configs/$KERNEL_DEFCONFIG"
+          if [ ! -f "$DEFCONFIG" ]; then
+            echo "ERROR: $DEFCONFIG not found"
+            exit 1
+          fi
+
+          set_config() {
+            local key="$1"
+            local value="$2"
+            sed -i "/^${key}=/d" "$DEFCONFIG"
+            sed -i "/^# ${key} is not set/d" "$DEFCONFIG"
+            echo "${key}=${value}" >> "$DEFCONFIG"
+          }
+
+          # Enable KernelSU and required symbol visibility
+          set_config CONFIG_KSU y
+          set_config CONFIG_KALLSYMS y
+          set_config CONFIG_KALLSYMS_ALL y
+
+          # Use ReSukiSU SUSFS inline hook method
+          set_config CONFIG_KSU_SUSFS y
+          set_config CONFIG_KSU_SUSFS_SUS_PATH y
+          set_config CONFIG_KSU_SUSFS_SUS_MOUNT y
+          set_config CONFIG_KSU_SUSFS_SUS_KSTAT y
+          set_config CONFIG_KSU_SUSFS_SPOOF_UNAME y
+          set_config CONFIG_KSU_SUSFS_ENABLE_LOG y
+          set_config CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS y
+          set_config CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG y
+          set_config CONFIG_KSU_SUSFS_OPEN_REDIRECT y
+          set_config CONFIG_KSU_SUSFS_SUS_MAP y
+
+          echo "Kernel configs enabled in $KERNEL_DEFCONFIG"
+
+      - name: Build kernel (KSU+SUSFS)
+        if: contains(fromJson('["ksu_susfs","both"]'), github.event.inputs.build_variant)
+        run: |
+          export PATH="$CLANG_DIR/bin:$PATH"
+          export ARCH=arm64
+          export SUBARCH=arm64
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          export KBUILD_COMPILER_STRING="$($CLANG_DIR/bin/clang --version | head -n 1 | perl -pe 's/\(http.*?\)//gs' | sed -e 's/  */ /g' -e 's/[[:space:]]*$//')"
+          cd "$KERNEL_DIR"
+          OUT_DIR="$KERNEL_DIR/out-ksu-susfs"
+          make O="$OUT_DIR" CC=clang LLVM=1 LLVM_IAS=1 KCFLAGS="-w" $KERNEL_DEFCONFIG
+          make -j$(nproc --all) O="$OUT_DIR" CC=clang LLVM=1 LLVM_IAS=1 KCFLAGS="-w"
+
+      - name: Package KSU+SUSFS build into AnyKernel zip
+        if: contains(fromJson('["ksu_susfs","both"]'), github.event.inputs.build_variant)
+        run: |
+          cd "$KERNEL_DIR"
+          OUT_DIR="$KERNEL_DIR/out-ksu-susfs"
+          ZIMAGE_DIR="$OUT_DIR/arch/arm64/boot"
+          TIME=$(date "+%Y%m%d-%H%M%S")
+          TEMP_ANY_KERNEL_DIR="$KERNEL_DIR/anykernel_temp_ksu"
+
+          rm -rf "$TEMP_ANY_KERNEL_DIR"
+
+          if [ -d "$KERNEL_DIR/anykernel" ]; then
+            cp -r "$KERNEL_DIR/anykernel" "$TEMP_ANY_KERNEL_DIR"
+          else
+            echo "Error: anykernel directory not found!"
+            exit 1
+          fi
+
+          if [ -f "$ZIMAGE_DIR/Image.gz-dtb" ]; then
+            cp -v "$ZIMAGE_DIR/Image.gz-dtb" "$TEMP_ANY_KERNEL_DIR/"
+          elif [ -f "$ZIMAGE_DIR/Image.gz" ]; then
+            cp -v "$ZIMAGE_DIR/Image.gz" "$TEMP_ANY_KERNEL_DIR/"
+          elif [ -f "$ZIMAGE_DIR/Image" ]; then
+            cp -v "$ZIMAGE_DIR/Image" "$TEMP_ANY_KERNEL_DIR/"
+          fi
+
+          ZIP_NAME="Raccoon-66-KSU-SUSFS-$TIME.zip"
+          cd "$TEMP_ANY_KERNEL_DIR"
+          zip -r9 "$KERNEL_DIR/$ZIP_NAME" ./*
+          cd ..
+          rm -rf "$TEMP_ANY_KERNEL_DIR"
+
+          echo "KSU_ZIP_NAME=$ZIP_NAME" >> "$GITHUB_ENV"
+
+      - name: Upload KSU+SUSFS zip artifact
+        if: contains(fromJson('["ksu_susfs","both"]'), github.event.inputs.build_variant)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.KSU_ZIP_NAME }}
+          path: kernel/${{ env.KSU_ZIP_NAME }}
           retention-days: 7
