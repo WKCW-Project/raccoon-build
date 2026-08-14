@@ -43,6 +43,8 @@ permissions:
 env:
   KERNEL_REPO: https://github.com/WKCW-Project/android_kernel_raccoon-66.git
   KERNEL_DEFCONFIG: raccoon_defconfig
+  KBUILD_BUILD_USER: byben
+  KBUILD_BUILD_HOST: wkcw
 
 jobs:
   build:
