@@ -10,7 +10,7 @@ on:
         type: choice
         options:
           - 'stock'          # Stock kernel only, no KernelSU/SUSFS
-          - 'ksu_susfs'       # ReSukiSU + SUSFS only
+          - 'ksu_susfs'       # BakaSU + SUSFS only
           - 'both'            # Build stock first, then KSU+SUSFS on top of the same clone
       clang_choice:
         description: 'Choose Clang toolchain'
@@ -163,9 +163,9 @@ jobs:
           [ -d "common" ] && KDIR="common"
           cd "$KDIR"
 
-          curl -LSs "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh" | bash
+          curl -LSs "https://raw.githubusercontent.com/Baka-SU/BakaSU/main/kernel/setup.sh" | bash
 
-          echo "ReSukiSU setup complete"
+          echo "BakaSU setup complete"
 
       - name: Setup SUSFS
         if: contains(fromJson('["ksu_susfs","both"]'), github.event.inputs.build_variant)
