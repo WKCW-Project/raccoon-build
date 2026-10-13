@@ -9,11 +9,11 @@ on:
         default: 'both'
         type: choice
         options:
-          - 'stock'          # Stock kernel only, no KernelSU/SUSFS
-          - 'ksu_susfs'       # BakaSU + SUSFS only
-          - 'both'            # Build stock first, then KSU+SUSFS on top of the same clone
+          - stock       # Stock kernel only, no BakaSU/SUSFS
+          - ksu_susfs   # BakaSU + SUSFS only
+          - both        # Stock first, then BakaSU+SUSFS on the same clone
       clang_choice:
-        description: 'Choose Clang toolchain'
+        description: 'Clang toolchain'
         required: true
         default: '1'
         type: choice
@@ -33,62 +33,180 @@ on:
           - 'no'
           - 'yes'
       release_tag:
-        description: 'Release tag (only used if create_release = yes, e.g. v1.0.0)'
+        description: 'Release tag (required if create_release = yes, e.g. v1.0.0)'
         required: false
         default: ''
 
 permissions:
   contents: write
 
-env:
-  KERNEL_REPO: https://github.com/WKCW-Project/android_kernel_raccoon-66.git
-  KERNEL_DEFCONFIG: raccoon_defconfig
-  KBUILD_BUILD_USER: byben
-  KBUILD_BUILD_HOST: wkcw
+concurrency:
+  group: build-raccoon-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash   # bash -eo pipefail
 
 jobs:
   build:
     runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    env:
+      KERNEL_REPO: WKCW-Project/android_kernel_raccoon-66
+      KERNEL_DEFCONFIG: raccoon_defconfig
+      KBUILD_BUILD_USER: byben
+      KBUILD_BUILD_HOST: wkcw
+      SUSFS_BRANCH: gki-android15-6.6
+      # Paths
+      MAIN: ${{ github.workspace }}
+      KERNEL_DIR: ${{ github.workspace }}/kernel
+      CLANG_DIR: ${{ github.workspace }}/toolchains/clang
+      HELPERS: ${{ runner.temp }}/ci
+      # Inputs passed via env (avoids injecting free text into shell scripts)
+      IN_VARIANT: ${{ inputs.build_variant }}
+      IN_CLANG: ${{ inputs.clang_choice }}
+      IN_RELEASE: ${{ inputs.create_release }}
+      IN_TAG: ${{ inputs.release_tag }}
+
     steps:
-      - name: Clone kernel source
+      # ------------------------------------------------------------------ #
+      # Preparation
+      # ------------------------------------------------------------------ #
+      - name: Validate inputs & resolve build flags
+        id: flags
         run: |
-          git clone --depth=1 --branch "${{ github.event.inputs.kernel_branch }}" \
-            "$KERNEL_REPO" "$GITHUB_WORKSPACE/kernel"
+          if [ "$IN_RELEASE" = "yes" ] && [ -z "$IN_TAG" ]; then
+            echo "::error::release_tag is required when create_release = yes"
+            exit 1
+          fi
+
+          case "$IN_VARIANT" in
+            stock)     stock=true;  ksu=false ;;
+            ksu_susfs) stock=false; ksu=true  ;;
+            both)      stock=true;  ksu=true  ;;
+            *) echo "::error::Unknown build_variant: $IN_VARIANT"; exit 1 ;;
+          esac
+
+          echo "stock=$stock" >> "$GITHUB_OUTPUT"
+          echo "ksu=$ksu"     >> "$GITHUB_OUTPUT"
+
+      - name: Clone kernel source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.KERNEL_REPO }}
+          ref: ${{ inputs.kernel_branch }}
+          path: kernel
+          fetch-depth: 1
 
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
-            clang lld llvm gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi \
-            gzip xz-utils lz4 zstd build-essential bc bison flex \
-            libssl-dev libncurses-dev dwarves git curl \
-            wget unzip rsync python3 python3-pip cmake binutils libelf-dev \
-            elfutils zip perl
+          sudo apt-get install -y --no-install-recommends \
+            bc binutils bison build-essential cmake curl dwarves elfutils flex \
+            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi git gzip libelf-dev \
+            libncurses-dev libssl-dev lld llvm lz4 perl python3 python3-pip \
+            rsync unzip wget xz-utils zip zstd clang
 
-      - name: Setup workspace paths
+      - name: Create helper scripts
         run: |
-          echo "MAIN=$GITHUB_WORKSPACE" >> "$GITHUB_ENV"
-          echo "KERNEL_DIR=$GITHUB_WORKSPACE/kernel" >> "$GITHUB_ENV"
-          echo "CLANG_DIR=$GITHUB_WORKSPACE/toolchains/clang" >> "$GITHUB_ENV"
+          mkdir -p "$HELPERS"
 
+          # ---- build.sh <out-dir-name> ----
+          cat > "$HELPERS/build.sh" <<'EOF'
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          OUT_DIR="$KERNEL_DIR/$1"
+
+          export PATH="$CLANG_DIR/bin:$PATH"
+          export ARCH=arm64
+          export SUBARCH=arm64
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          KBUILD_COMPILER_STRING="$(clang --version | head -n 1 \
+            | perl -pe 's/\(http.*?\)//gs' \
+            | sed -e 's/  */ /g' -e 's/[[:space:]]*$//')"
+          export KBUILD_COMPILER_STRING
+
+          cd "$KERNEL_DIR"
+          MAKE_ARGS=(
+            O="$OUT_DIR" CC=clang LLVM=1 LLVM_IAS=1 KCFLAGS="-w"
+            KBUILD_BUILD_USER="$KBUILD_BUILD_USER"
+            KBUILD_BUILD_HOST="$KBUILD_BUILD_HOST"
+          )
+
+          make "${MAKE_ARGS[@]}" "$KERNEL_DEFCONFIG"
+          make -j"$(nproc --all)" "${MAKE_ARGS[@]}"
+          EOF
+
+          # ---- package.sh <out-dir-name> <label> ----
+          cat > "$HELPERS/package.sh" <<'EOF'
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          OUT_DIR="$KERNEL_DIR/$1"
+          LABEL="$2"
+          BOOT_DIR="$OUT_DIR/arch/arm64/boot"
+          TIME="$(date '+%Y%m%d-%H%M%S')"
+          TMP_DIR="$KERNEL_DIR/anykernel_temp_$LABEL"
+          ZIP_NAME="Raccoon-66-$LABEL-$TIME.zip"
+
+          [ -d "$KERNEL_DIR/anykernel" ] || { echo "::error::anykernel directory not found!"; exit 1; }
+
+          rm -rf "$TMP_DIR"
+          cp -r "$KERNEL_DIR/anykernel" "$TMP_DIR"
+
+          found=""
+          for img in Image.gz-dtb Image.gz Image; do
+            if [ -f "$BOOT_DIR/$img" ]; then
+              cp -v "$BOOT_DIR/$img" "$TMP_DIR/"
+              found="$img"
+              break
+            fi
+          done
+          [ -n "$found" ] || { echo "::error::No kernel image found in $BOOT_DIR"; exit 1; }
+
+          (cd "$TMP_DIR" && zip -r9 "$KERNEL_DIR/$ZIP_NAME" ./*)
+          rm -rf "$TMP_DIR"
+
+          echo "zip_name=$ZIP_NAME" >> "$GITHUB_OUTPUT"
+          EOF
+
+          chmod +x "$HELPERS"/*.sh
+
+      # ------------------------------------------------------------------ #
+      # Toolchain
+      # ------------------------------------------------------------------ #
       - name: Cache Clang toolchain
         id: clang-cache
         uses: actions/cache@v4
         with:
           path: ${{ env.CLANG_DIR }}
-          key: clang-${{ github.event.inputs.clang_choice }}
+          key: clang-${{ inputs.clang_choice }}-v1
 
-      - name: Download / Setup Clang
+      - name: Download Clang
         if: steps.clang-cache.outputs.cache-hit != 'true'
         run: |
           mkdir -p "$CLANG_DIR"
-          if [ "${{ github.event.inputs.clang_choice }}" = "1" ]; then
-            CLANG_URL="https://github.com/ZyCromerZ/Clang/releases/download/16.0.6-20250721-release/Clang-16.0.6-20250721.tar.gz"
-            wget -O "$MAIN/clang.tar.gz" "$CLANG_URL"
+
+          retry() {
+            local n
+            for n in 1 2 3 4 5; do
+              "$@" && return 0
+              echo "Attempt $n/5 failed, retrying in $((n * 20))s..."
+              sleep $((n * 20))
+            done
+            return 1
+          }
+
+          if [ "$IN_CLANG" = "1" ]; then
+            URL="https://github.com/ZyCromerZ/Clang/releases/download/16.0.6-20250721-release/Clang-16.0.6-20250721.tar.gz"
+            retry wget -q -O "$MAIN/clang.tar.gz" "$URL"
             tar -xf "$MAIN/clang.tar.gz" -C "$CLANG_DIR"
             rm -f "$MAIN/clang.tar.gz"
           else
-            git clone --depth=1 https://gitlab.com/jjpprrrr/prelude-clang.git "$CLANG_DIR"
+            rm -rf "$CLANG_DIR"
+            retry git clone --depth=1 https://gitlab.com/jjpprrrr/prelude-clang.git "$CLANG_DIR"
           fi
 
       - name: Verify Clang
@@ -96,205 +214,131 @@ jobs:
           export PATH="$CLANG_DIR/bin:$PATH"
           clang --version
 
+      # ------------------------------------------------------------------ #
+      # Stock build
+      # ------------------------------------------------------------------ #
       - name: Build kernel (stock)
-        if: contains(fromJson('["stock","both"]'), github.event.inputs.build_variant)
-        run: |
-          export PATH="$CLANG_DIR/bin:$PATH"
-          export ARCH=arm64
-          export SUBARCH=arm64
-          export CROSS_COMPILE=aarch64-linux-gnu-
-          export KBUILD_COMPILER_STRING="$($CLANG_DIR/bin/clang --version | head -n 1 | perl -pe 's/\(http.*?\)//gs' | sed -e 's/  */ /g' -e 's/[[:space:]]*$//')"
-          cd "$KERNEL_DIR"
-          OUT_DIR="$KERNEL_DIR/out-stock"
-          make O="$OUT_DIR" CC=clang LLVM=1 LLVM_IAS=1 KCFLAGS="-w" $KERNEL_DEFCONFIG
-          make -j$(nproc --all) O="$OUT_DIR" CC=clang LLVM=1 LLVM_IAS=1 KCFLAGS="-w"
+        if: steps.flags.outputs.stock == 'true'
+        run: $HELPERS/build.sh out-stock
 
-      - name: Package stock build into AnyKernel zip
-        if: contains(fromJson('["stock","both"]'), github.event.inputs.build_variant)
-        run: |
-          cd "$KERNEL_DIR"
-          OUT_DIR="$KERNEL_DIR/out-stock"
-          ZIMAGE_DIR="$OUT_DIR/arch/arm64/boot"
-          TIME=$(date "+%Y%m%d-%H%M%S")
-          TEMP_ANY_KERNEL_DIR="$KERNEL_DIR/anykernel_temp_stock"
+      - name: Package stock zip
+        id: pack_stock
+        if: steps.flags.outputs.stock == 'true'
+        run: $HELPERS/package.sh out-stock Stock
 
-          rm -rf "$TEMP_ANY_KERNEL_DIR"
-
-          if [ -d "$KERNEL_DIR/anykernel" ]; then
-            cp -r "$KERNEL_DIR/anykernel" "$TEMP_ANY_KERNEL_DIR"
-          else
-            echo "Error: anykernel directory not found!"
-            exit 1
-          fi
-
-          if [ -f "$ZIMAGE_DIR/Image.gz-dtb" ]; then
-            cp -v "$ZIMAGE_DIR/Image.gz-dtb" "$TEMP_ANY_KERNEL_DIR/"
-          elif [ -f "$ZIMAGE_DIR/Image.gz" ]; then
-            cp -v "$ZIMAGE_DIR/Image.gz" "$TEMP_ANY_KERNEL_DIR/"
-          elif [ -f "$ZIMAGE_DIR/Image" ]; then
-            cp -v "$ZIMAGE_DIR/Image" "$TEMP_ANY_KERNEL_DIR/"
-          fi
-
-          ZIP_NAME="Raccoon-66-Stock-$TIME.zip"
-          cd "$TEMP_ANY_KERNEL_DIR"
-          zip -r9 "$KERNEL_DIR/$ZIP_NAME" ./*
-          cd ..
-          rm -rf "$TEMP_ANY_KERNEL_DIR"
-
-          echo "STOCK_ZIP_NAME=$ZIP_NAME" >> "$GITHUB_ENV"
-
-      - name: Upload stock zip artifact
-        if: contains(fromJson('["stock","both"]'), github.event.inputs.build_variant)
+      - name: Upload stock zip
+        if: steps.flags.outputs.stock == 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ env.STOCK_ZIP_NAME }}
-          path: kernel/${{ env.STOCK_ZIP_NAME }}
+          name: ${{ steps.pack_stock.outputs.zip_name }}
+          path: kernel/${{ steps.pack_stock.outputs.zip_name }}
           retention-days: 7
 
-      - name: Setup ReSukiSU
-        if: contains(fromJson('["ksu_susfs","both"]'), github.event.inputs.build_variant)
+      # ------------------------------------------------------------------ #
+      # BakaSU + SUSFS build
+      # ------------------------------------------------------------------ #
+      - name: Setup BakaSU
+        if: steps.flags.outputs.ksu == 'true'
         run: |
-          set -euo pipefail
-
-          echo "=== Setting up ReSukiSU ==="
-
           cd "$KERNEL_DIR"
-          KDIR="."
-          [ -d "common" ] && KDIR="common"
-          cd "$KDIR"
+          [ -d common ] && cd common
 
-          curl -LSs "https://raw.githubusercontent.com/Baka-SU/BakaSU/main/kernel/setup.sh" | bash
-
+          curl -fLSs "https://raw.githubusercontent.com/Baka-SU/BakaSU/main/kernel/setup.sh" | bash
           echo "BakaSU setup complete"
 
       - name: Setup SUSFS
-        if: contains(fromJson('["ksu_susfs","both"]'), github.event.inputs.build_variant)
+        if: steps.flags.outputs.ksu == 'true'
         run: |
-          set -euo pipefail
-
-          SUSFS_BRANCH="gki-android15-6.6"
+          clone_with_retry() {
+            local url="$1" branch="$2" dest="$3" n
+            for n in 1 2 3 4 5; do
+              if git clone --depth=1 "$url" -b "$branch" "$dest"; then
+                return 0
+              fi
+              echo "Clone failed (attempt $n/5), retrying in $((n * 20))s..."
+              rm -rf "$dest"
+              sleep $((n * 20))
+            done
+            return 1
+          }
 
           echo "=== Setting up SUSFS (branch: $SUSFS_BRANCH) ==="
-
-          git clone --depth=1 https://gitlab.com/simonpunk/susfs4ksu.git -b "$SUSFS_BRANCH" "$MAIN/susfs4ksu"
+          clone_with_retry https://gitlab.com/simonpunk/susfs4ksu.git \
+            "$SUSFS_BRANCH" "$MAIN/susfs4ksu"
 
           cd "$KERNEL_DIR"
-          KDIR="."
-          [ -d "common" ] && KDIR="common"
-          cd "$KDIR"
+          [ -d common ] && cd common
 
-          # Copy SUSFS kernel patches
+          PATCH="50_add_susfs_in_${SUSFS_BRANCH}.patch"
+
           cp "$MAIN/susfs4ksu/kernel_patches/fs/"* fs/
           cp "$MAIN/susfs4ksu/kernel_patches/include/linux/"* include/linux/
-
-          # Apply SUSFS GKI patch
-          cp "$MAIN/susfs4ksu/kernel_patches/50_add_susfs_in_gki-android15-6.6.patch" .
-          patch -p1 < 50_add_susfs_in_gki-android15-6.6.patch
+          cp "$MAIN/susfs4ksu/kernel_patches/$PATCH" .
+          patch -p1 --no-backup-if-mismatch < "$PATCH"
 
           echo "SUSFS setup complete"
 
-      - name: Enable Kernel Configs
-        if: contains(fromJson('["ksu_susfs","both"]'), github.event.inputs.build_variant)
+      - name: Enable kernel configs
+        if: steps.flags.outputs.ksu == 'true'
         run: |
-          set -euo pipefail
-
           cd "$KERNEL_DIR"
-          KDIR="."
-          [ -d "common" ] && KDIR="common"
-          cd "$KDIR"
+          [ -d common ] && cd common
 
           DEFCONFIG="arch/arm64/configs/$KERNEL_DEFCONFIG"
-          if [ ! -f "$DEFCONFIG" ]; then
-            echo "ERROR: $DEFCONFIG not found"
-            exit 1
-          fi
+          [ -f "$DEFCONFIG" ] || { echo "::error::$DEFCONFIG not found"; exit 1; }
 
           set_config() {
-            local key="$1"
-            local value="$2"
-            sed -i "/^${key}=/d" "$DEFCONFIG"
-            sed -i "/^# ${key} is not set/d" "$DEFCONFIG"
-            echo "${key}=${value}" >> "$DEFCONFIG"
+            sed -i -e "/^$1=/d" -e "/^# $1 is not set/d" "$DEFCONFIG"
+            echo "$1=$2" >> "$DEFCONFIG"
           }
 
-          # Enable KernelSU and required symbol visibility
+          # BakaSU (CONFIG_KSU) + symbol visibility
           set_config CONFIG_KSU y
           set_config CONFIG_KALLSYMS y
           set_config CONFIG_KALLSYMS_ALL y
 
-          # Use ReSukiSU SUSFS inline hook method
-          set_config CONFIG_KSU_SUSFS y
-          set_config CONFIG_KSU_SUSFS_SUS_PATH y
-          set_config CONFIG_KSU_SUSFS_SUS_MOUNT y
-          set_config CONFIG_KSU_SUSFS_SUS_KSTAT y
-          set_config CONFIG_KSU_SUSFS_SPOOF_UNAME y
-          set_config CONFIG_KSU_SUSFS_ENABLE_LOG y
-          set_config CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS y
-          set_config CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG y
-          set_config CONFIG_KSU_SUSFS_OPEN_REDIRECT y
-          set_config CONFIG_KSU_SUSFS_SUS_MAP y
+          # SUSFS
+          for opt in \
+            CONFIG_KSU_SUSFS \
+            CONFIG_KSU_SUSFS_SUS_PATH \
+            CONFIG_KSU_SUSFS_SUS_MOUNT \
+            CONFIG_KSU_SUSFS_SUS_KSTAT \
+            CONFIG_KSU_SUSFS_SPOOF_UNAME \
+            CONFIG_KSU_SUSFS_ENABLE_LOG \
+            CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS \
+            CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG \
+            CONFIG_KSU_SUSFS_OPEN_REDIRECT \
+            CONFIG_KSU_SUSFS_SUS_MAP
+          do
+            set_config "$opt" y
+          done
 
           echo "Kernel configs enabled in $KERNEL_DEFCONFIG"
 
-      - name: Build kernel (KSU+SUSFS)
-        if: contains(fromJson('["ksu_susfs","both"]'), github.event.inputs.build_variant)
-        run: |
-          export PATH="$CLANG_DIR/bin:$PATH"
-          export ARCH=arm64
-          export SUBARCH=arm64
-          export CROSS_COMPILE=aarch64-linux-gnu-
-          export KBUILD_COMPILER_STRING="$($CLANG_DIR/bin/clang --version | head -n 1 | perl -pe 's/\(http.*?\)//gs' | sed -e 's/  */ /g' -e 's/[[:space:]]*$//')"
-          cd "$KERNEL_DIR"
-          OUT_DIR="$KERNEL_DIR/out-ksu-susfs"
-          make O="$OUT_DIR" CC=clang LLVM=1 LLVM_IAS=1 KCFLAGS="-w" $KERNEL_DEFCONFIG
-          make -j$(nproc --all) O="$OUT_DIR" CC=clang LLVM=1 LLVM_IAS=1 KCFLAGS="-w"
+      - name: Build kernel (BakaSU+SUSFS)
+        if: steps.flags.outputs.ksu == 'true'
+        run: $HELPERS/build.sh out-ksu-susfs
 
-      - name: Package KSU+SUSFS build into AnyKernel zip
-        if: contains(fromJson('["ksu_susfs","both"]'), github.event.inputs.build_variant)
-        run: |
-          cd "$KERNEL_DIR"
-          OUT_DIR="$KERNEL_DIR/out-ksu-susfs"
-          ZIMAGE_DIR="$OUT_DIR/arch/arm64/boot"
-          TIME=$(date "+%Y%m%d-%H%M%S")
-          TEMP_ANY_KERNEL_DIR="$KERNEL_DIR/anykernel_temp_ksu"
+      - name: Package BakaSU+SUSFS zip
+        id: pack_ksu
+        if: steps.flags.outputs.ksu == 'true'
+        run: $HELPERS/package.sh out-ksu-susfs BakaSU-SUSFS
 
-          rm -rf "$TEMP_ANY_KERNEL_DIR"
-
-          if [ -d "$KERNEL_DIR/anykernel" ]; then
-            cp -r "$KERNEL_DIR/anykernel" "$TEMP_ANY_KERNEL_DIR"
-          else
-            echo "Error: anykernel directory not found!"
-            exit 1
-          fi
-
-          if [ -f "$ZIMAGE_DIR/Image.gz-dtb" ]; then
-            cp -v "$ZIMAGE_DIR/Image.gz-dtb" "$TEMP_ANY_KERNEL_DIR/"
-          elif [ -f "$ZIMAGE_DIR/Image.gz" ]; then
-            cp -v "$ZIMAGE_DIR/Image.gz" "$TEMP_ANY_KERNEL_DIR/"
-          elif [ -f "$ZIMAGE_DIR/Image" ]; then
-            cp -v "$ZIMAGE_DIR/Image" "$TEMP_ANY_KERNEL_DIR/"
-          fi
-
-          ZIP_NAME="Raccoon-66-KSU-SUSFS-$TIME.zip"
-          cd "$TEMP_ANY_KERNEL_DIR"
-          zip -r9 "$KERNEL_DIR/$ZIP_NAME" ./*
-          cd ..
-          rm -rf "$TEMP_ANY_KERNEL_DIR"
-
-          echo "KSU_ZIP_NAME=$ZIP_NAME" >> "$GITHUB_ENV"
-
-      - name: Upload KSU+SUSFS zip artifact
-        if: contains(fromJson('["ksu_susfs","both"]'), github.event.inputs.build_variant)
+      - name: Upload BakaSU+SUSFS zip
+        if: steps.flags.outputs.ksu == 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ env.KSU_ZIP_NAME }}
-          path: kernel/${{ env.KSU_ZIP_NAME }}
+          name: ${{ steps.pack_ksu.outputs.zip_name }}
+          path: kernel/${{ steps.pack_ksu.outputs.zip_name }}
           retention-days: 7
 
+      # ------------------------------------------------------------------ #
+      # Release
+      # ------------------------------------------------------------------ #
       - name: Create GitHub Release
-        if: github.event.inputs.create_release == 'yes'
+        if: inputs.create_release == 'yes'
         uses: softprops/action-gh-release@v3
         with:
-          tag_name: ${{ github.event.inputs.release_tag }}
-          name: ${{ github.event.inputs.release_tag }}
-          files: kernel/*.zip
+          tag_name: ${{ inputs.release_tag }}
+          name: ${{ inputs.release_tag }}
+          files: kernel/Raccoon-66-*.zip
