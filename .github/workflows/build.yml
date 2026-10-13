@@ -62,7 +62,6 @@ jobs:
       MAIN: ${{ github.workspace }}
       KERNEL_DIR: ${{ github.workspace }}/kernel
       CLANG_DIR: ${{ github.workspace }}/toolchains/clang
-      HELPERS: ${{ runner.temp }}/ci
       # Inputs passed via env (avoids injecting free text into shell scripts)
       IN_VARIANT: ${{ inputs.build_variant }}
       IN_CLANG: ${{ inputs.clang_choice }}
@@ -110,6 +109,8 @@ jobs:
 
       - name: Create helper scripts
         run: |
+          HELPERS="$RUNNER_TEMP/ci"
+          echo "HELPERS=$HELPERS" >> "$GITHUB_ENV"
           mkdir -p "$HELPERS"
 
           # ---- build.sh <out-dir-name> ----
